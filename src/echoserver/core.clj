@@ -13,104 +13,86 @@
       (swap! room-list assoc roomname room)
       room)))
 
-(defn delete-empty-rooms! []
-  (swap! room-list
-        #(apply dissoc % (for [[k v] % :when (empty? @v)] k))))
+(defn delete-room! [roomname]
+  (let [room (@room-list roomname)]
+    (if (empty? @room) 
+      (swap! room-list dissoc roomname))))
          
+(defn rand-username []
+  (str "Guest" (rand-int 10000)))
 
-(defn agent-add-user-to-room [room username out]
-  (if (not (room username))
+(defn in-room? [room username]
+  (let [out (room username)]
+    (and out (= out *out*))))
+
+(defn agent-add-user [room username out]
+  (if-not (room username)
     (assoc room username out)
     room))
 
-(defn agent-remove-user-from-room [room username]
-  (dissoc room username))
-  
-(defn agent-print-to-room [room msg]
+(defn agent-say [room msg]
   (doseq [[_ out] room]
     (binding [*out* out] (println msg)))
   room)
 
-(defn agent-swap-username [room old-username new-username]
-  (if (not (room new-username))
-    (let [out (room old-username)]
-      (assoc (dissoc room old-username) new-username out))
-    room))
+(defn agent-remove-user [room username]
+  (dissoc room username))
 
+(defn agent-swap-username [room username new-username]
+  (if-not (room new-username)
+    (let [out (room username)]
+      (assoc (dissoc room username) new-username out))
+  room))
 
-(defn add-user-to-room []
-  (send *room* agent-add-user-to-room *username* *out*))
+(defn add-user [roomname username]
+  (let [room (add-get-room! roomname)]
+    (loop [curr-username username]
+      (send room agent-add-user curr-username *out*)
+      (await room)
+      (if (in-room? @room curr-username)
+        (list roomname curr-username)
+        (recur (rand-username))))))
+          
+(defn remove-user [roomname username]
+  (let [room (@room-list roomname)]
+    (if (and room (in-room? @room username))
+      (do
+        (send room agent-remove-user username)
+        (await room)
+        (send room agent-say (str username " has left the room."))
+        (delete-room! roomname)))))
 
-(defn remove-user-from-room []
-  (send *room* agent-remove-user-from-room *username*)
-  (if (empty? @*room*) (delete-empty-rooms!)))
+(defn say [roomname username msg]
+  (send (@room-list roomname) agent-say (str username ": " msg)))
 
-(defn say-to-room [msg]
-  (send *room* agent-print-to-room (str *username* ": " msg)))
-
-(defn announce-join-to-room []
-  (if *room* (send *room* agent-print-to-room (str *username* " has joined the room."))))
-
-(defn announce-leave-to-room []
-  (if *room* (send *room* agent-print-to-room (str *username* " has left the room."))))
-
-(defn announce-change-username-to-room [new-username]
-  (send *room* agent-print-to-room (str *username* " is now known as " new-username ".")))
-
-(defn swap-username [new-username] 
-  (send *room* agent-swap-username *username* new-username))
-
-(defn rand-username []
-  (str "Guest" (rand-int 10000)))
-
-(defn in-room? []
-  (let [user (@*room* *username*)]
-    (and user (= *out* user))))
-
-(defn clean-exit []
-  (remove-user-from-room)
-  (announce-leave-to-room))
-
+(defn swap-username [roomname username new-username] 
+  (let [room (@room-list roomname)]
+    (send room agent-swap-username username new-username)
+    (await room)
+    (if (in-room? @room username)
+      (do
+        (println "Nick commmand failed, username taken.")
+        (list roomname username))
+      (do
+        (send room agent-say (str username " is now known as " new-username))
+        (list roomname new-username)))))
 
 (defn -main
   "I don't do a whole lot ... yet."
   [& args]
   (server.socket/create-server 9999
     (fn [in out]
-      (binding [*username* "Guest"
-                *room* nil
-                *in* (BufferedReader. (InputStreamReader. in))
+      (binding [ *in* (BufferedReader. (InputStreamReader. in))
                 *out* (PrintWriter. out)]
-        (try
-          (loop [line "/join Default"]
-            (if line
-              (let [[cmd & args] (clojure.string/split line #" ")]
-                (case cmd
-                  "/join" (do
-                            (if *room* 
-                              (do
-                                (remove-user-from-room)
-                                (announce-leave-to-room)))
-                            (set! *room* (add-get-room! (first args)))
-                            (add-user-to-room)
-                            (await *room*)
-                            (while (not (in-room?))
-                              (set! *username* (rand-username))
-                              (add-user-to-room)
-                              (await *room*))
-                            (announce-join-to-room)
-                            (recur (read-line)))
-                  "/nick" (let [new-username (first args)]
-                            (swap-username new-username)
-                            (await *room*)
-                            (if (not (in-room?))
-                              (do
-                                (announce-change-username-to-room new-username)
-                                (set! *username* new-username))
-                              (println "nick command failed, username taken"))
-                            (recur (read-line)))
-                  "/exit"   :done
-                  (do
-                    (say-to-room line)
-                    (recur (read-line)))))))
-          (finally (clean-exit)))))))
+          (loop [[roomname username] ["Default" (rand-username)] input "/join Default"]
+            (let [[cmd & args] (clojure.string/split input #" ")]
+              (case cmd
+                "/join" (do
+                          (remove-user roomname username)
+                          (recur (add-user (first args) username) (read-line)))
+                "/nick" (recur (swap-username roomname username (first args)) (read-line))
+                "/exit" (remove-user roomname username)
+                (do
+                  (say roomname username input)
+                  (recur [roomname username] (read-line))))))))))
+
